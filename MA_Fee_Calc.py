@@ -336,8 +336,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Charts")
     show_gross = st.checkbox("Gross NAV anzeigen", value=True)
-    show_drawdown = st.checkbox("Drawdown Chart", value=True)
-    show_fee_drag = st.checkbox("Fee Drag Chart", value=True)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -499,40 +498,8 @@ with row2a:
     )
     st.plotly_chart(fig_mfees, use_container_width=True)
 
-with row2b:
-    fig_bps = go.Figure()
-    fig_bps.add_trace(go.Scatter(x=m_plot["MonthStr"], y=m_plot["FeeRate_MF_bps"], mode="lines+markers", name="Mgmt Fee (bps)"))
-    fig_bps.add_trace(go.Scatter(x=m_plot["MonthStr"], y=m_plot["FeeRate_total_bps"], mode="lines+markers", name="Total Fee (bps)"))
-    fig_bps.update_layout(
-        title="Fee Rate (bps) – Monatsbasis",
-        xaxis_title="Monat",
-        yaxis_title="bps",
-        margin=dict(l=10, r=10, t=60, b=10),
-        height=420,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
-    st.plotly_chart(fig_bps, use_container_width=True)
 
-if show_drawdown or show_fee_drag:
-    st.divider()
-    cdd, cfd = st.columns([1.0, 1.0])
 
-    if show_drawdown:
-        with cdd:
-            fig_dd = go.Figure()
-            if show_gross:
-                fig_dd.add_trace(go.Scatter(x=df["Date"], y=df["DD_gross"], mode="lines", name="Drawdown Gross", line=dict(width=2)))
-            fig_dd.add_trace(go.Scatter(x=df["Date"], y=df["DD_net"], mode="lines", name="Drawdown Net", line=dict(width=3)))
-            fig_dd.update_layout(
-                title="Drawdown (Gross vs Net)",
-                xaxis_title="Datum",
-                yaxis_title="Drawdown",
-                yaxis_tickformat=".1%",
-                margin=dict(l=10, r=10, t=60, b=10),
-                height=420,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            )
-            st.plotly_chart(fig_dd, use_container_width=True)
 
     if show_fee_drag:
         with cfd:
