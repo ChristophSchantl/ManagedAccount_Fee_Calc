@@ -48,19 +48,14 @@ class FeeParams:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers (robust parsing)
+# Helpers (robust parsing + Arrow-safe display)
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_float_pct(x: float) -> float:
-    # UI convenience: accept 2 => 0.02
     return x / 100.0 if x > 1.0 else x
 
 
 def to_number_series(s: pd.Series) -> pd.Series:
-    """
-    Robust numeric parser for EU/US formats.
-    - Accepts: "1,234.56" (US), "1.234,56" (EU), "1234.56", "1234,56"
-    - Returns float Series (NaN if not parseable)
-    """
+    """Robust numeric parser for EU/US formats."""
     if pd.api.types.is_numeric_dtype(s):
         return s.astype(float)
 
@@ -68,30 +63,56 @@ def to_number_series(s: pd.Series) -> pd.Series:
     s2 = s2.str.replace("\u00A0", "", regex=False)  # non-breaking space
     s2 = s2.str.replace(" ", "", regex=False)
 
-    # Heuristic:
-    # If there is a comma and the last comma is after the last dot -> treat comma as decimal separator (EU)
     last_comma = s2.str.rfind(",")
     last_dot = s2.str.rfind(".")
     eu_mask = (last_comma > last_dot) & s2.str.contains(",")
 
-    # EU: remove thousands dots, replace decimal comma with dot
     s2_eu = s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-
-    # US: remove thousands commas
     s2_us = s2.str.replace(",", "", regex=False)
 
     s3 = pd.Series(np.where(eu_mask, s2_eu, s2_us), index=s.index)
     return pd.to_numeric(s3, errors="coerce")
 
 
+def arrow_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make a DataFrame safe for Streamlit Cloud's Arrow serialization.
+    - removes tz info
+    - converts Period/Interval and "object with lists/dicts" to string
+    - resets index
+    """
+    out = df.copy()
+    out = out.reset_index(drop=True)
+
+    # datetime: ensure tz-naive
+    for c in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[c]):
+            out[c] = pd.to_datetime(out[c], errors="coerce")
+            try:
+                if getattr(out[c].dt, "tz", None) is not None:
+                    out[c] = out[c].dt.tz_convert(None)
+            except Exception:
+                out[c] = out[c].astype(str)
+
+    # Period/Interval -> str
+    for c in out.columns:
+        dt = str(out[c].dtype)
+        if dt.startswith(("period", "interval")):
+            out[c] = out[c].astype(str)
+
+    # object columns with non-serializable python objects -> str
+    obj_cols = out.select_dtypes(include=["object"]).columns
+    for c in obj_cols:
+        sample = out[c].dropna().head(100)
+        if len(sample) > 0:
+            if sample.map(lambda x: isinstance(x, (dict, list, tuple, set))).any():
+                out[c] = out[c].astype(str)
+
+    return out
+
+
 def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) -> pd.DataFrame:
-    """
-    Expects columns:
-      - date_col: parseable datetime
-      - price_col: numeric or numeric-like strings
-    """
     if upload is None:
-        # Demo series
         idx = pd.bdate_range("2023-01-02", periods=520)
         rng = np.random.default_rng(7)
         rets = rng.normal(loc=0.00025, scale=0.012, size=len(idx))
@@ -142,32 +163,26 @@ def fmt_pct(x: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fee Engine (gross -> mgmt fee -> HWM -> perf fee -> net)
+# Fee Engine
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
-    df = df_prices.copy()
-    df = df.sort_values(p.date_col).reset_index(drop=True)
+    df = df_prices.copy().sort_values(p.date_col).reset_index(drop=True)
     df = df.rename(columns={p.date_col: "Date", p.price_col: "Close"})
 
-    # Optional hardening: resample to business days to remove gaps
     if p.resample_bdays:
-        df = df.set_index("Date").asfreq("B").ffill()
-        df = df.reset_index()
+        df = df.set_index("Date").asfreq("B").ffill().reset_index()
 
-    # Calendar-day gaps (FeeEngine-style “Tage”)
     df["Tage"] = df["Date"].diff().dt.days.fillna(0).astype(int)
-    df.loc[df["Tage"] < 0, "Tage"] = 0  # just in case of messy input
+    df.loc[df["Tage"] < 0, "Tage"] = 0
 
     base_price = float(df.loc[0, "Close"])
     df["Brutto_Rendite"] = df["Close"] / base_price
     df["NAV_gross"] = p.start_nav * df["Brutto_Rendite"]
 
-    # Mgmt fee accrual on NAV_gross
     df["MF_Amount"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
     df.loc[df["Tage"] == 0, "MF_Amount"] = 0.0
     df["NAV_nach_MF"] = df["NAV_gross"] - df["MF_Amount"]
 
-    # Perf fee on High Water Mark (post Mgmt fee)
     df["Month"] = df["Date"].dt.to_period("M").dt.to_timestamp()
 
     df["HWM_alt"] = np.nan
@@ -179,7 +194,6 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     hwm = float(p.start_nav)
 
     if p.perf_crystallization == "daily":
-        # Daily crystallization (aggressiv; als Modell/Simulation ok)
         for i in range(len(df)):
             df.at[i, "HWM_alt"] = hwm
             nav_after_mf = float(df.at[i, "NAV_nach_MF"])
@@ -194,12 +208,10 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
             df.at[i, "HWM_neu"] = hwm_new
             hwm = hwm_new
     else:
-        # Monthly crystallization (typisch)
         months = df["Month"].values
         for i in range(len(df)):
             df.at[i, "HWM_alt"] = hwm
             nav_after_mf = float(df.at[i, "NAV_nach_MF"])
-
             is_month_end = (i == len(df) - 1) or (months[i] != months[i + 1])
 
             pf_basis = 0.0
@@ -219,18 +231,15 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
             df.at[i, "NAV_net"] = nav_net
             df.at[i, "HWM_neu"] = hwm_new
 
-    # Cum fees
     df["MF_kum"] = df["MF_Amount"].cumsum()
     df["PF_kum"] = df["PF_Amount"].cumsum()
     df["Fees_kum_total"] = df["MF_kum"] + df["PF_kum"]
 
-    # Indices, drawdowns
     df["NAV_gross_idx"] = df["NAV_gross"] / p.start_nav
     df["NAV_net_idx"] = df["NAV_net"] / p.start_nav
     df["DD_gross"] = df["NAV_gross"] / df["NAV_gross"].cummax() - 1.0
     df["DD_net"] = df["NAV_net"] / df["NAV_net"].cummax() - 1.0
 
-    # Monthly summary (presentation-friendly)
     m = df.groupby("Month", as_index=False).agg(
         NAV_gross=("NAV_gross", "last"),
         NAV_net=("NAV_net", "last"),
@@ -249,7 +258,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("FeeEngine – Managed Account Fee Calculator")
-st.caption("NAV, Fees, HWM & Fee Drag – mit CSV/XLSX Input, KPI-Tiles, Plotly-Charts und Exports.")
+st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Arrow-safe)")
 
 with st.sidebar:
     st.header("Inputs")
@@ -275,7 +284,7 @@ with st.sidebar:
     )
 
     st.subheader("Daten-Härtung")
-    resample_bdays = st.checkbox("Business-Day Resample + Forward Fill", value=False, help="Stabilisiert Fees bei Lücken im Input.")
+    resample_bdays = st.checkbox("Business-Day Resample + Forward Fill", value=False)
 
     st.divider()
     st.subheader("Charts")
@@ -284,9 +293,7 @@ with st.sidebar:
     show_fee_drag = st.checkbox("Fee Drag Chart", value=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Compute
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     df_prices = parse_prices(upload, date_col, price_col)
     params = FeeParams(
@@ -305,10 +312,7 @@ except Exception as e:
     st.error(f"Input/Parsing/Compute Fehler: {e}")
     st.stop()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 # KPIs
-# ──────────────────────────────────────────────────────────────────────────────
 start_date = df["Date"].iloc[0]
 end_date = df["Date"].iloc[-1]
 total_days = int((end_date - start_date).days)
@@ -327,7 +331,6 @@ gross_cagr = cagr(params.start_nav, nav_gross_end, total_days)
 net_cagr = cagr(params.start_nav, nav_net_end, total_days)
 
 net_vol = ann_vol_log(df["NAV_net"])
-gross_vol = ann_vol_log(df["NAV_gross"])
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Start NAV", fmt_money(params.start_nav))
@@ -339,10 +342,7 @@ c6.metric("Fee Drag (TR)", fmt_pct(fee_drag_tr))
 
 st.divider()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Charts – NAV & HWM + Cum Fees
-# ──────────────────────────────────────────────────────────────────────────────
 left, right = st.columns([1.35, 1.0])
 
 with left:
@@ -351,7 +351,6 @@ with left:
         fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_gross"], mode="lines", name="NAV Gross", line=dict(width=2)))
     fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_net"], mode="lines", name="NAV Net", line=dict(width=3)))
     fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["HWM_neu"], mode="lines", name="HWM (Net)", line=dict(width=1, dash="dot")))
-
     fig_nav.update_layout(
         title="NAV Entwicklung & High Water Mark",
         xaxis_title="Datum",
@@ -367,7 +366,6 @@ with right:
     fig_fees.add_trace(go.Scatter(x=df["Date"], y=df["MF_kum"], mode="lines", name="Mgmt Fees (cum)", line=dict(width=2)))
     fig_fees.add_trace(go.Scatter(x=df["Date"], y=df["PF_kum"], mode="lines", name="Perf Fees (cum)", line=dict(width=2)))
     fig_fees.add_trace(go.Scatter(x=df["Date"], y=df["Fees_kum_total"], mode="lines", name="Total Fees (cum)", line=dict(width=3)))
-
     fig_fees.update_layout(
         title="Kumulierte Fees",
         xaxis_title="Datum",
@@ -378,10 +376,7 @@ with right:
     )
     st.plotly_chart(fig_fees, use_container_width=True)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Charts – Monthly fees & bps
-# ──────────────────────────────────────────────────────────────────────────────
+# Monthly charts
 row2a, row2b = st.columns([1.0, 1.0])
 
 with row2a:
@@ -415,7 +410,6 @@ with row2b:
     )
     st.plotly_chart(fig_bps, use_container_width=True)
 
-
 if show_drawdown or show_fee_drag:
     st.divider()
     cdd, cfd = st.columns([1.0, 1.0])
@@ -441,7 +435,6 @@ if show_drawdown or show_fee_drag:
         with cfd:
             df_drag = df[["Date", "NAV_gross_idx", "NAV_net_idx"]].copy()
             df_drag["FeeDrag_idx"] = df_drag["NAV_gross_idx"] - df_drag["NAV_net_idx"]
-
             fig_drag = go.Figure()
             fig_drag.add_trace(go.Scatter(x=df_drag["Date"], y=df_drag["FeeDrag_idx"], mode="lines", name="Fee Drag (Index)", line=dict(width=3)))
             fig_drag.update_layout(
@@ -454,10 +447,7 @@ if show_drawdown or show_fee_drag:
             )
             st.plotly_chart(fig_drag, use_container_width=True)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tables + Exports (NO Styler: Streamlit Cloud safe)
-# ──────────────────────────────────────────────────────────────────────────────
+# Tables + Exports (Arrow-safe)
 st.divider()
 tab1, tab2 = st.tabs(["Detail-Tabelle", "Downloads"])
 
@@ -468,16 +458,14 @@ with tab1:
         "HWM_alt", "PF_Basis", "PF_Amount",
         "NAV_net", "HWM_neu",
         "MF_kum", "PF_kum", "Fees_kum_total",
+        "Month",
     ]
-
-    # only add if present (defensive)
     view_cols = [c for c in view_cols if c in df.columns]
 
     display_df = df[view_cols].copy()
     display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
-    display_df["Date"] = pd.to_datetime(display_df["Date"], errors="coerce")
 
-    # Round numeric cols safely (no .round(dict) to avoid pandas edge-cases)
+    # Safe rounding (no dict-round)
     round_map: Dict[str, int] = {
         "Close": 2,
         "Brutto_Rendite": 6,
@@ -493,12 +481,12 @@ with tab1:
         "PF_kum": 2,
         "Fees_kum_total": 2,
     }
-
     for col, nd in round_map.items():
         if col in display_df.columns:
             display_df[col] = to_number_series(display_df[col]).round(nd)
 
-    st.dataframe(display_df, use_container_width=True, height=520)
+    display_safe = arrow_safe_df(display_df)
+    st.dataframe(display_safe, use_container_width=True, height=520)
 
 with tab2:
     out = df.copy()
@@ -509,16 +497,21 @@ with tab2:
     out.insert(4, "Perf_Mode", params.perf_crystallization)
     out.insert(5, "Resample_BDays", params.resample_bdays)
 
-    csv_bytes = out.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download Detail (CSV)", data=csv_bytes, file_name="feeengine_detail.csv", mime="text/csv")
+    st.download_button(
+        "⬇️ Download Detail (CSV)",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="feeengine_detail.csv",
+        mime="text/csv",
+    )
 
-    monthly_csv = m.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download Monthly Summary (CSV)", data=monthly_csv, file_name="feeengine_monthly.csv", mime="text/csv")
+    st.download_button(
+        "⬇️ Download Monthly Summary (CSV)",
+        data=m.to_csv(index=False).encode("utf-8"),
+        file_name="feeengine_monthly.csv",
+        mime="text/csv",
+    )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Footer
-# ──────────────────────────────────────────────────────────────────────────────
 st.caption(
     f"Modus: {params.perf_crystallization.upper()} | "
     f"Zeitraum: {start_date.date()} – {end_date.date()} | "
