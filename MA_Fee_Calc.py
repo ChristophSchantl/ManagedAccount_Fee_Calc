@@ -1,4 +1,3 @@
-
 # Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
 # Dependencies: streamlit, pandas, numpy, plotly, openpyxl
 
@@ -39,7 +38,7 @@ st.markdown(
 class FeeParams:
     mgmt_fee_pa: float              # e.g. 0.02
     perf_fee: float                 # e.g. 0.20
-    min_mgmt_fee_monthly: float     # e.g. 3000.0 (monthly floor)
+    min_mgmt_fee_monthly: float     # monthly floor, NAV-relevant (month-end true-up)
     start_nav: float                # e.g. 1_000_000
     daycount: int                   # 360/365
     perf_crystallization: str       # "daily" or "monthly"
@@ -133,7 +132,7 @@ def fmt_pct(x: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fee Engine (inkl. Min. Mgmt Fee/Monat als Month-End True-Up)
+# Fee Engine (inkl. Min. Mgmt Fee/Monat als Month-End True-Up) — NAV-relevant
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df = df_prices.copy().sort_values(p.date_col).reset_index(drop=True)
@@ -152,7 +151,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     # Arrow-safe month key (string)
     df["Month"] = df["Date"].dt.strftime("%Y-%m")
 
-    # Mgmt Fee: daily accrual (MF_Base) + month-end True-Up to reach floor
+    # Mgmt Fee: daily accrual (MF_Base) + month-end True-Up to reach floor (NAV-relevant)
     df["MF_Base"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
     df.loc[df["Tage"] == 0, "MF_Base"] = 0.0
 
@@ -181,7 +180,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df["MF_Amount"] = df["MF_Base"] + df["MF_MinAdj"]
     df["NAV_nach_MF"] = df["NAV_gross"] - df["MF_Amount"]
 
-    # Performance fee + HWM
+    # Performance fee + HWM (basis: NAV_nach_MF)
     df["HWM_alt"] = np.nan
     df["PF_Basis"] = 0.0
     df["PF_Amount"] = 0.0
@@ -270,14 +269,17 @@ with st.sidebar:
     date_col = st.text_input("Datum-Spalte", value="Date")
     price_col = st.text_input("Preis-Spalte", value="Close")
 
-    st.subheader("Fee-Parameter")
+    st.subheader("Fee-Parameter (NAV-relevant)")
     mgmt_fee_ui = st.number_input("Mgmt_Fee_p_a (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25)
     perf_fee_ui = st.number_input("Perf_Fee (%)", min_value=0.0, max_value=50.0, value=20.0, step=1.0)
     start_nav = st.number_input("Start_NAV", min_value=1_000.0, max_value=1_000_000_000.0, value=1_000_000.0, step=10_000.0)
+
+    # Floor (Minimum) bleibt — entspricht deinem "Fixum" in der Diskussion
     min_mgmt_fee_monthly = st.number_input(
-        "Min. Mgmt Fee pro Monat (€)",
+        "Management Fee Minimum / Floor (€/Monat, NAV-relevant)",
         min_value=0.0, max_value=1_000_000.0,
-        value=3000.0, step=100.0
+        value=3000.0, step=100.0,
+        key="min_mgmt_fee_monthly"
     )
 
     daycount = st.selectbox("Daycount", options=[360, 365], index=1)
@@ -294,42 +296,35 @@ with st.sidebar:
     resample_bdays = st.checkbox("Business-Day Resample + Forward Fill", value=False)
 
     st.divider()
-    st.subheader("Angestellter PM – Spanien (Fixkosten)")
 
-    with st.sidebar.form("pm_costs_form"):
-        monthly_gross_salary = st.number_input(
-            "Fixgehalt Brutto pro Monat (€)",
-            min_value=0.0, max_value=50_000.0,
-            value=3000.0, step=100.0,
-            key="pm_gross_month"
-        )
-    
-        employer_social_rate = st.number_input(
-            "AG Sozialabgaben (%)",
-            min_value=0.0, max_value=50.0,
-            value=30.0, step=1.0,
-            key="ag_social_rate_pct"
-        ) / 100.0
-    
-        employee_social_rate = st.number_input(
-            "AN Sozialabgaben (%)",
-            min_value=0.0, max_value=20.0,
-            value=6.35, step=0.25,
-            key="an_social_rate_pct"
-        ) / 100.0
-    
-        employee_irpf_rate = st.number_input(
-            "IRPF effektiv (Balearen, %)",
-            min_value=0.0, max_value=40.0,
-            value=17.0, step=0.5,
-            key="irpf_rate_pct"
-        ) / 100.0
-    
-        st.form_submit_button("Apply / Recalculate")
+    # INFO BLOCK: Spain payroll assumptions (only informational; NOT NAV-relevant)
+    with st.expander("ℹ️ Spanien (Balearen) – Netto/Abgaben (nur Info)", expanded=True):
+        st.caption("Diese Annahmen dienen nur zur Information (FO/Investor). Sie beeinflussen den NAV nicht.")
 
+        with st.form("pm_costs_form"):
+            employer_social_rate = st.number_input(
+                "AG Sozialabgaben (%)",
+                min_value=0.0, max_value=50.0,
+                value=30.0, step=1.0,
+                key="ag_social_rate_pct"
+            ) / 100.0
 
-    
-    with st.sidebar:
+            employee_social_rate = st.number_input(
+                "AN Sozialabgaben (%)",
+                min_value=0.0, max_value=20.0,
+                value=6.35, step=0.25,
+                key="an_social_rate_pct"
+            ) / 100.0
+
+            employee_irpf_rate = st.number_input(
+                "IRPF effektiv (Balearen, %)",
+                min_value=0.0, max_value=40.0,
+                value=17.0, step=0.5,
+                key="irpf_rate_pct"
+            ) / 100.0
+
+            st.form_submit_button("Apply / Recalculate")
+
         st.markdown(
             '<div class="smallnote">'
             'Default: Balearen ~6.35 % AN-Sozialabgaben, ~16–18 % IRPF effektiv '
@@ -338,8 +333,6 @@ with st.sidebar:
             unsafe_allow_html=True
         )
 
-
-
     st.divider()
     st.subheader("Charts")
     show_gross = st.checkbox("Gross NAV anzeigen", value=True)
@@ -347,7 +340,9 @@ with st.sidebar:
     show_fee_drag = st.checkbox("Fee Drag Chart", value=True)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Compute
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     df_prices = parse_prices(upload, date_col, price_col)
     params = FeeParams(
@@ -368,18 +363,32 @@ except Exception as e:
     st.error(f"Input/Parsing/Compute Fehler: {e}")
     st.stop()
 
-# Spain employee costs (OPEX, not NAV-relevant)
-employer_cost_month = float(monthly_gross_salary) * (1.0 + float(employer_social_rate))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Spain payroll INFO (OPEX / compensation view; NOT NAV-relevant)
+# Convention: "Fixum" = Floor (Minimum Mgmt Fee per month)
+# ──────────────────────────────────────────────────────────────────────────────
+pm_gross_month = float(params.min_mgmt_fee_monthly)  # Fixum-Interpretation
+pm_gross_year = pm_gross_month * 12.0
+
+employer_cost_month = pm_gross_month * (1.0 + float(employer_social_rate))
 employer_cost_year = employer_cost_month * 12.0
+
 employee_net_month = (
-    float(monthly_gross_salary)
+    pm_gross_month
     * (1.0 - float(employee_social_rate))
     * (1.0 - float(employee_irpf_rate))
 )
-
 employee_net_year = employee_net_month * 12.0
 
+# extra: realized/avg mgmt fee (useful for FO economics)
+avg_mf_month = float(m["MF"].mean()) if len(m) else np.nan
+binds_floor_share = float((m["MF_MinAdj"] > 0).mean()) if len(m) else np.nan  # share of months where floor binds
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # KPIs
+# ──────────────────────────────────────────────────────────────────────────────
 start_date = df["Date"].iloc[0]
 end_date = df["Date"].iloc[-1]
 total_days = int((end_date - start_date).days)
@@ -398,7 +407,6 @@ gross_cagr = cagr(params.start_nav, nav_gross_end, total_days)
 net_cagr = cagr(params.start_nav, nav_net_end, total_days)
 net_vol = ann_vol_log(df["NAV_net"])
 
-avg_mf_month = float(m["MF"].mean()) if len(m) else np.nan
 avg_total_fee_month = float((m["MF"] + m["PF"]).mean()) if len(m) else np.nan
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -409,17 +417,29 @@ c4.metric("Fees Total", fmt_money(fees_total), f"{(fees_total/params.start_nav)*
 c5.metric("Mgmt / Perf Fees", f"{fmt_money(fees_mf)} / {fmt_money(fees_pf)}")
 c6.metric("Fee Drag (TR)", fmt_pct(fee_drag_tr))
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Economics / Info block (aligns with your narrative)
+# ──────────────────────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Fixkosten – Angestellter Portfolio Manager (Spanien)")
+st.subheader("Fixum & Payroll-Info (Spanien/Balearen) – nur Information (nicht NAV-relevant)")
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Brutto PM (Monat)", f"{fmt_money(monthly_gross_salary)} €")
-k2.metric("Netto PM (Monat)", f"{fmt_money(employee_net_month)} €")
-k3.metric("FO Gesamtkosten (Monat)", f"{fmt_money(employer_cost_month)} €")
-k4.metric("FO Gesamtkosten (p.a.)", f"{fmt_money(employer_cost_year)} €")
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Fixum = Mgmt Fee Floor (€/Monat)", f"{fmt_money(pm_gross_month)} €")
+k2.metric("Netto-Schätzung PM (€/Monat)", f"{fmt_money(employee_net_month)} €")
+k3.metric("FO Gesamtkosten (€/Monat)", f"{fmt_money(employer_cost_month)} €")
+k4.metric("Avg Mgmt Fee realisiert (€/Monat)", f"{fmt_money(avg_mf_month)} €" if np.isfinite(avg_mf_month) else "n/a")
+k5.metric("Floor bindet (Monate)", f"{binds_floor_share*100:,.0f}%" if np.isfinite(binds_floor_share) else "n/a")
+
+st.caption(
+    "Interpretation: Im ersten Jahr wird das Fixum als Management-Fee-Minimum (Floor) modelliert. "
+    "Die Payroll-Zahlen dienen nur als Info für FO/Investor und beeinflussen die NAV-Berechnung nicht."
+)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Charts – NAV & HWM + Cum Fees
+# ──────────────────────────────────────────────────────────────────────────────
 st.divider()
 left, right = st.columns([1.35, 1.0])
 
@@ -466,11 +486,11 @@ with row2a:
 
     fig_mfees = go.Figure()
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_Base"], name="Mgmt Fee (Base)"))
-    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_MinAdj"], name="Mgmt Fee (Min Adj)"))
+    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_MinAdj"], name="Mgmt Fee (Min Adj / Floor True-Up)"))
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["PF"], name="Perf Fee"))
     fig_mfees.update_layout(
         barmode="stack",
-        title="Fees pro Monat (Stacked) – inkl. Min-Fee True-Up",
+        title="Fees pro Monat (Stacked) – inkl. Floor True-Up",
         xaxis_title="Monat",
         yaxis_title="Fee Amount",
         margin=dict(l=10, r=10, t=60, b=40),
@@ -588,18 +608,17 @@ with tab2:
     out = df.copy()
     out.insert(0, "Mgmt_Fee_p_a", params.mgmt_fee_pa)
     out.insert(1, "Perf_Fee", params.perf_fee)
-    out.insert(2, "Min_Mgmt_Fee_Monthly", params.min_mgmt_fee_monthly)
+    out.insert(2, "Mgmt_Fee_Floor_Monthly", params.min_mgmt_fee_monthly)
     out.insert(3, "Start_NAV", params.start_nav)
     out.insert(4, "Daycount", params.daycount)
     out.insert(5, "Perf_Mode", params.perf_crystallization)
     out.insert(6, "Resample_BDays", params.resample_bdays)
 
-    # Spain employee assumptions to exports
-    out.insert(7, "PM_Gross_Month", float(monthly_gross_salary))
+    # Spain payroll assumptions (INFO only) — exported for transparency
+    out.insert(7, "PM_Fixum_Floor_Month", float(pm_gross_month))
     out.insert(8, "AG_Social_Rate", float(employer_social_rate))
     out.insert(9, "AN_Social_Rate", float(employee_social_rate))
     out.insert(10, "IRPF_Rate", float(employee_irpf_rate))
-
 
     out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
 
@@ -629,3 +648,4 @@ st.caption(
     f"Net CAGR: {fmt_pct(net_cagr) if np.isfinite(net_cagr) else 'n/a'} | "
     f"Net Vol (ann., log): {fmt_pct(net_vol) if np.isfinite(net_vol) else 'n/a'}"
 )
+
