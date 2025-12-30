@@ -1,7 +1,6 @@
-# streamlit_app.py
+
 # FeeEngine – Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
 # Dependencies: streamlit, pandas, numpy, plotly, openpyxl
-# Run: streamlit run streamlit_app.py
 
 from __future__ import annotations
 
