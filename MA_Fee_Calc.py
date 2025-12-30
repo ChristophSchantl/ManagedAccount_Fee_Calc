@@ -458,15 +458,15 @@ with tab1:
         "HWM_alt", "PF_Basis", "PF_Amount",
         "NAV_net", "HWM_neu",
         "MF_kum", "PF_kum", "Fees_kum_total",
-        "Month",
+        # "Month",  # <- optional: wenn drin, muss es sicher zu String
     ]
     view_cols = [c for c in view_cols if c in df.columns]
 
     display_df = df[view_cols].copy()
     display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
 
-    # Safe rounding (no dict-round)
-    round_map: Dict[str, int] = {
+    # --- Runde numeric safely (ohne pandas .round(dict)) ---
+    round_map = {
         "Close": 2,
         "Brutto_Rendite": 6,
         "NAV_gross": 2,
@@ -483,10 +483,29 @@ with tab1:
     }
     for col, nd in round_map.items():
         if col in display_df.columns:
-            display_df[col] = to_number_series(display_df[col]).round(nd)
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce").round(nd)
 
-    display_safe = arrow_safe_df(display_df)
+    # --- Arrow-safe conversion (KILL SWITCH included) ---
+    display_safe = display_df.copy()
+
+    # Dates -> ISO string (100% safe)
+    if "Date" in display_safe.columns:
+        display_safe["Date"] = pd.to_datetime(display_safe["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # Falls irgendwo Period/Interval/Objects drin sind: alles auf String ziehen
+    # (Damit ist Arrow/JSON garantiert glücklich, auch auf Python 3.13)
+    for c in display_safe.columns:
+        if str(display_safe[c].dtype).startswith(("period", "interval")):
+            display_safe[c] = display_safe[c].astype(str)
+        elif display_safe[c].dtype == "object":
+            display_safe[c] = display_safe[c].astype(str)
+
+    # Ultimate safety: remaining exotic dtypes ebenfalls string
+    display_safe = display_safe.astype(str)
+
     st.dataframe(display_safe, use_container_width=True, height=520)
+
+
 
 with tab2:
     out = df.copy()
