@@ -501,22 +501,6 @@ with row2a:
 
 
 
-    if show_fee_drag:
-        with cfd:
-            df_drag = df[["Date", "NAV_gross_idx", "NAV_net_idx"]].copy()
-            df_drag["FeeDrag_idx"] = df_drag["NAV_gross_idx"] - df_drag["NAV_net_idx"]
-            fig_drag = go.Figure()
-            fig_drag.add_trace(go.Scatter(x=df_drag["Date"], y=df_drag["FeeDrag_idx"], mode="lines", name="Fee Drag (Index)", line=dict(width=3)))
-            fig_drag.update_layout(
-                title="Fee Drag über Zeit (Gross-Index minus Net-Index)",
-                xaxis_title="Datum",
-                yaxis_title="Index Punkte",
-                margin=dict(l=10, r=10, t=60, b=10),
-                height=420,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            )
-            st.plotly_chart(fig_drag, use_container_width=True)
-
 # Tables + Exports (Arrow-safe)
 st.divider()
 tab1, tab2 = st.tabs(["Detail-Tabelle", "Downloads"])
