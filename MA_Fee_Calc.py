@@ -1,5 +1,5 @@
 
-# FeeEngine – Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
+# Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
 # Dependencies: streamlit, pandas, numpy, plotly, openpyxl
 
 from __future__ import annotations
@@ -272,7 +272,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
-st.title("FeeEngine – Managed Account Fee Calculator")
+st.title("Managed Account Fee Calculator")
 st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Arrow-safe)")
 
 with st.sidebar:
