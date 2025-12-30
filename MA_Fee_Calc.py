@@ -472,26 +472,34 @@ with tab1:
         "MF_kum", "PF_kum", "Fees_kum_total",
         "T_Fee_pDay",
     ]
+
+    display_df = df[view_cols].copy()
+
+    # Professionelle Darstellung ohne Styler (Arrow-safe)
+    round_map = {
+        "Close": 2,
+        "Brutto_Rendite": 6,
+        "NAV_gross": 2,
+        "MF_Amount": 2,
+        "NAV_nach_MF": 2,
+        "HWM_alt": 2,
+        "PF_Basis": 2,
+        "PF_Amount": 2,
+        "NAV_net": 2,
+        "HWM_neu": 2,
+        "MF_kum": 2,
+        "PF_kum": 2,
+        "Fees_kum_total": 2,
+        "T_Fee_pDay": 2,
+    }
+    display_df = display_df.round(round_map)
+
     st.dataframe(
-        df[view_cols].style.format({
-            "Close": "{:,.2f}",
-            "Brutto_Rendite": "{:,.6f}",
-            "NAV_gross": "{:,.2f}",
-            "MF_Amount": "{:,.2f}",
-            "NAV_nach_MF": "{:,.2f}",
-            "HWM_alt": "{:,.2f}",
-            "PF_Basis": "{:,.2f}",
-            "PF_Amount": "{:,.2f}",
-            "NAV_net": "{:,.2f}",
-            "HWM_neu": "{:,.2f}",
-            "MF_kum": "{:,.2f}",
-            "PF_kum": "{:,.2f}",
-            "Fees_kum_total": "{:,.2f}",
-            "T_Fee_pDay": "{:,.2f}",
-        }),
+        display_df,
         use_container_width=True,
         height=520,
     )
+
 
 with tab2:
     out = df.copy()
