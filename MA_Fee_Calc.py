@@ -458,61 +458,39 @@ with tab1:
         "HWM_alt", "PF_Basis", "PF_Amount",
         "NAV_net", "HWM_neu",
         "MF_kum", "PF_kum", "Fees_kum_total",
-        # "Month",  # <- optional: wenn drin, muss es sicher zu String
     ]
     view_cols = [c for c in view_cols if c in df.columns]
 
     display_df = df[view_cols].copy()
     display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
 
-    # --- Runde numeric safely (ohne pandas .round(dict)) ---
+    # Format numerics
     round_map = {
-        "Close": 2,
-        "Brutto_Rendite": 6,
-        "NAV_gross": 2,
-        "MF_Amount": 2,
-        "NAV_nach_MF": 2,
-        "HWM_alt": 2,
-        "PF_Basis": 2,
-        "PF_Amount": 2,
-        "NAV_net": 2,
-        "HWM_neu": 2,
-        "MF_kum": 2,
-        "PF_kum": 2,
-        "Fees_kum_total": 2,
+        "Close": 2, "Brutto_Rendite": 6, "NAV_gross": 2, "MF_Amount": 2,
+        "NAV_nach_MF": 2, "HWM_alt": 2, "PF_Basis": 2, "PF_Amount": 2,
+        "NAV_net": 2, "HWM_neu": 2, "MF_kum": 2, "PF_kum": 2, "Fees_kum_total": 2
     }
     for col, nd in round_map.items():
         if col in display_df.columns:
             display_df[col] = pd.to_numeric(display_df[col], errors="coerce").round(nd)
 
-    # --- Arrow-safe conversion (KILL SWITCH included) ---
+    # Make everything string for perfect stability
     display_safe = display_df.copy()
-
-    # Dates -> ISO string (100% safe)
     if "Date" in display_safe.columns:
         display_safe["Date"] = pd.to_datetime(display_safe["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-
-    # Falls irgendwo Period/Interval/Objects drin sind: alles auf String ziehen
-    # (Damit ist Arrow/JSON garantiert glücklich, auch auf Python 3.13)
-    for c in display_safe.columns:
-        if str(display_safe[c].dtype).startswith(("period", "interval")):
-            display_safe[c] = display_safe[c].astype(str)
-        elif display_safe[c].dtype == "object":
-            display_safe[c] = display_safe[c].astype(str)
-
-    # Ultimate safety: remaining exotic dtypes ebenfalls string
     display_safe = display_safe.astype(str)
 
-    # Arrow-free table rendering (Streamlit Cloud / Py3.13-proof)
-    html = display_safe.to_html(index=False)
+    # IMPORTANT: no st.dataframe here (Arrow crash)
     st.markdown(
         f"""
-        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.1); border-radius:8px; padding:6px;">
-          {html}
+        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.12);
+                    border-radius:10px; padding:8px;">
+          {display_safe.to_html(index=False)}
         </div>
         """,
         unsafe_allow_html=True
     )
+
 
 
 
