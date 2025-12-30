@@ -1,13 +1,13 @@
-# streamlit_app.py
-# FeeEngine – Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
-# Dependencies: streamlit, pandas, numpy, plotly, openpyxl
-# Run: streamlit run streamlit_app.py
+# MA_Fee_Calc.py
+# FeeEngine – Managed Account Fee Calculator (Streamlit Cloud / Python 3.13 SAFE)
+# IMPORTANT: NO st.dataframe / NO st.table  -> avoids pyarrow JSON metadata crashes
+# Run: streamlit run MA_Fee_Calc.py
 
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,11 @@ st.markdown(
       .block-container { padding-top: 1.0rem; padding-bottom: 2.0rem; }
       div[data-testid="stMetricValue"] { font-size: 1.45rem; }
       div[data-testid="stMetricLabel"] { font-size: 0.9rem; opacity: 0.85; }
+
+      table { border-collapse: collapse; width: 100%; font-size: 12px; }
+      th, td { border: 1px solid rgba(0,0,0,0.10); padding: 6px 8px; text-align: right; }
+      th { position: sticky; top: 0; background: rgba(250,250,250,0.98); z-index: 2; text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -37,20 +42,20 @@ st.markdown(
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class FeeParams:
-    mgmt_fee_pa: float          # e.g. 0.02
-    perf_fee: float             # e.g. 0.20
-    start_nav: float            # e.g. 1_000_000
+    mgmt_fee_pa: float          # 0.02
+    perf_fee: float             # 0.20
+    start_nav: float            # 1_000_000
     daycount: int               # 360/365
-    perf_crystallization: str   # "daily" or "monthly"
+    perf_crystallization: str   # "monthly" or "daily"
     date_col: str
     price_col: str
-    resample_bdays: bool        # optional hardening
+    resample_bdays: bool
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers (robust parsing + Arrow-safe display)
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def _to_float_pct(x: float) -> float:
+def pct_to_float(x: float) -> float:
     return x / 100.0 if x > 1.0 else x
 
 
@@ -60,59 +65,23 @@ def to_number_series(s: pd.Series) -> pd.Series:
         return s.astype(float)
 
     s2 = s.astype(str).str.strip()
-    s2 = s2.str.replace("\u00A0", "", regex=False)  # non-breaking space
-    s2 = s2.str.replace(" ", "", regex=False)
+    s2 = s2.str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False)
 
     last_comma = s2.str.rfind(",")
     last_dot = s2.str.rfind(".")
     eu_mask = (last_comma > last_dot) & s2.str.contains(",")
 
-    s2_eu = s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    s2_us = s2.str.replace(",", "", regex=False)
+    s_eu = s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    s_us = s2.str.replace(",", "", regex=False)
 
-    s3 = pd.Series(np.where(eu_mask, s2_eu, s2_us), index=s.index)
+    s3 = pd.Series(np.where(eu_mask, s_eu, s_us), index=s.index)
     return pd.to_numeric(s3, errors="coerce")
 
 
-def arrow_safe_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make a DataFrame safe for Streamlit Cloud's Arrow serialization.
-    - removes tz info
-    - converts Period/Interval and "object with lists/dicts" to string
-    - resets index
-    """
-    out = df.copy()
-    out = out.reset_index(drop=True)
-
-    # datetime: ensure tz-naive
-    for c in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[c]):
-            out[c] = pd.to_datetime(out[c], errors="coerce")
-            try:
-                if getattr(out[c].dt, "tz", None) is not None:
-                    out[c] = out[c].dt.tz_convert(None)
-            except Exception:
-                out[c] = out[c].astype(str)
-
-    # Period/Interval -> str
-    for c in out.columns:
-        dt = str(out[c].dtype)
-        if dt.startswith(("period", "interval")):
-            out[c] = out[c].astype(str)
-
-    # object columns with non-serializable python objects -> str
-    obj_cols = out.select_dtypes(include=["object"]).columns
-    for c in obj_cols:
-        sample = out[c].dropna().head(100)
-        if len(sample) > 0:
-            if sample.map(lambda x: isinstance(x, (dict, list, tuple, set))).any():
-                out[c] = out[c].astype(str)
-
-    return out
-
-
 def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) -> pd.DataFrame:
+    """Input: CSV/XLSX with date_col + price_col."""
     if upload is None:
+        # demo series
         idx = pd.bdate_range("2023-01-02", periods=520)
         rng = np.random.default_rng(7)
         rets = rng.normal(loc=0.00025, scale=0.012, size=len(idx))
@@ -122,7 +91,7 @@ def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) ->
     name = getattr(upload, "name", "").lower()
     raw = upload.read()
 
-    if name.endswith(".xlsx") or name.endswith(".xls"):
+    if name.endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(raw))
     else:
         df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
@@ -133,7 +102,10 @@ def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) ->
     df = df[[date_col, price_col]].copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df[price_col] = to_number_series(df[price_col])
+
     df = df.dropna().sort_values(date_col).drop_duplicates(subset=[date_col])
+    if df.empty:
+        raise ValueError("Nach Parsing ist keine gültige Zeitreihe übrig geblieben.")
     return df
 
 
@@ -154,12 +126,35 @@ def ann_vol_log(nav: pd.Series) -> float:
     return float(r.std(ddof=1) * np.sqrt(252))
 
 
-def fmt_money(x: float) -> str:
+def fmt_money0(x: float) -> str:
     return f"{x:,.0f}"
 
 
 def fmt_pct(x: float) -> str:
-    return f"{x*100:,.2f}%"
+    return f"{x * 100:,.2f}%"
+
+
+def render_html_table(df: pd.DataFrame, height_px: int = 520, title: Optional[str] = None) -> None:
+    """Arrow-free HTML table renderer (Streamlit Cloud safe)."""
+    if title:
+        st.subheader(title)
+
+    # Make sure nothing exotic is inside: convert to strings for display only
+    safe = df.copy()
+    for c in safe.columns:
+        if pd.api.types.is_datetime64_any_dtype(safe[c]):
+            safe[c] = pd.to_datetime(safe[c], errors="coerce").dt.strftime("%Y-%m-%d")
+    safe = safe.astype(str)
+
+    st.markdown(
+        f"""
+        <div style="max-height:{height_px}px; overflow:auto; border:1px solid rgba(0,0,0,0.12);
+                    border-radius:12px; padding:8px; background: white;">
+          {safe.to_html(index=False, escape=False)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -179,11 +174,13 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df["Brutto_Rendite"] = df["Close"] / base_price
     df["NAV_gross"] = p.start_nav * df["Brutto_Rendite"]
 
+    # Mgmt fee accrual (calendar daycount)
     df["MF_Amount"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
     df.loc[df["Tage"] == 0, "MF_Amount"] = 0.0
     df["NAV_nach_MF"] = df["NAV_gross"] - df["MF_Amount"]
 
-    df["Month"] = df["Date"].dt.to_period("M").dt.to_timestamp()
+    # Month marker (keep as datetime, not Period, to avoid exotic dtypes)
+    df["Month"] = pd.to_datetime(df["Date"].dt.to_period("M").dt.to_timestamp())
 
     df["HWM_alt"] = np.nan
     df["PF_Basis"] = 0.0
@@ -240,17 +237,17 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df["DD_gross"] = df["NAV_gross"] / df["NAV_gross"].cummax() - 1.0
     df["DD_net"] = df["NAV_net"] / df["NAV_net"].cummax() - 1.0
 
-    m = df.groupby("Month", as_index=False).agg(
+    monthly = df.groupby("Month", as_index=False).agg(
         NAV_gross=("NAV_gross", "last"),
         NAV_net=("NAV_net", "last"),
         MF=("MF_Amount", "sum"),
         PF=("PF_Amount", "sum"),
         Fees=("Fees_kum_total", "last"),
     )
-    m["FeeRate_MF_bps"] = (m["MF"] / m["NAV_gross"]) * 1e4
-    m["FeeRate_total_bps"] = ((m["MF"] + m["PF"]) / m["NAV_gross"]) * 1e4
-    df.attrs["monthly"] = m
+    monthly["FeeRate_MF_bps"] = (monthly["MF"] / monthly["NAV_gross"]) * 1e4
+    monthly["FeeRate_total_bps"] = ((monthly["MF"] + monthly["PF"]) / monthly["NAV_gross"]) * 1e4
 
+    df.attrs["monthly"] = monthly
     return df
 
 
@@ -258,7 +255,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("FeeEngine – Managed Account Fee Calculator")
-st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Arrow-safe)")
+st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Arrow/pyarrow-proof)")
 
 with st.sidebar:
     st.header("Inputs")
@@ -297,8 +294,8 @@ with st.sidebar:
 try:
     df_prices = parse_prices(upload, date_col, price_col)
     params = FeeParams(
-        mgmt_fee_pa=_to_float_pct(float(mgmt_fee_ui)),
-        perf_fee=_to_float_pct(float(perf_fee_ui)),
+        mgmt_fee_pa=pct_to_float(float(mgmt_fee_ui)),
+        perf_fee=pct_to_float(float(perf_fee_ui)),
         start_nav=float(start_nav),
         daycount=int(daycount),
         perf_crystallization=str(perf_mode),
@@ -312,9 +309,10 @@ except Exception as e:
     st.error(f"Input/Parsing/Compute Fehler: {e}")
     st.stop()
 
+
 # KPIs
-start_date = df["Date"].iloc[0]
-end_date = df["Date"].iloc[-1]
+start_date = pd.to_datetime(df["Date"].iloc[0])
+end_date = pd.to_datetime(df["Date"].iloc[-1])
 total_days = int((end_date - start_date).days)
 
 nav_gross_end = float(df["NAV_gross"].iloc[-1])
@@ -331,16 +329,18 @@ gross_cagr = cagr(params.start_nav, nav_gross_end, total_days)
 net_cagr = cagr(params.start_nav, nav_net_end, total_days)
 
 net_vol = ann_vol_log(df["NAV_net"])
+gross_vol = ann_vol_log(df["NAV_gross"])
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Start NAV", fmt_money(params.start_nav))
-c2.metric("End NAV (Net)", fmt_money(nav_net_end), fmt_pct(net_tr))
+c1.metric("Start NAV", fmt_money0(params.start_nav))
+c2.metric("End NAV (Net)", fmt_money0(nav_net_end), fmt_pct(net_tr))
 c3.metric("CAGR (Net)", fmt_pct(net_cagr) if np.isfinite(net_cagr) else "n/a")
-c4.metric("Fees Total", fmt_money(fees_total), f"{(fees_total/params.start_nav)*100:,.2f}% of Start")
-c5.metric("Mgmt / Perf Fees", f"{fmt_money(fees_mf)} / {fmt_money(fees_pf)}")
+c4.metric("Fees Total", fmt_money0(fees_total), f"{(fees_total/params.start_nav)*100:,.2f}% of Start")
+c5.metric("Mgmt / Perf Fees", f"{fmt_money0(fees_mf)} / {fmt_money0(fees_pf)}")
 c6.metric("Fee Drag (TR)", fmt_pct(fee_drag_tr))
 
 st.divider()
+
 
 # Charts – NAV & HWM + Cum Fees
 left, right = st.columns([1.35, 1.0])
@@ -376,12 +376,13 @@ with right:
     )
     st.plotly_chart(fig_fees, use_container_width=True)
 
+
 # Monthly charts
 row2a, row2b = st.columns([1.0, 1.0])
 
 with row2a:
     m_plot = m.copy()
-    m_plot["MonthStr"] = m_plot["Month"].dt.strftime("%Y-%m")
+    m_plot["MonthStr"] = pd.to_datetime(m_plot["Month"]).dt.strftime("%Y-%m")
     fig_mfees = go.Figure()
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF"], name="Mgmt Fee"))
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["PF"], name="Perf Fee"))
@@ -409,6 +410,7 @@ with row2b:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     st.plotly_chart(fig_bps, use_container_width=True)
+
 
 if show_drawdown or show_fee_drag:
     st.divider()
@@ -447,12 +449,13 @@ if show_drawdown or show_fee_drag:
             )
             st.plotly_chart(fig_drag, use_container_width=True)
 
-# Tables + Exports (Arrow-safe)
+
+# Tables + Exports (NO Arrow)
 st.divider()
 tab1, tab2 = st.tabs(["Detail-Tabelle", "Downloads"])
 
 with tab1:
-    view_cols = [
+    view_cols: List[str] = [
         "Date", "Close", "Tage", "Brutto_Rendite",
         "NAV_gross", "MF_Amount", "NAV_nach_MF",
         "HWM_alt", "PF_Basis", "PF_Amount",
@@ -460,40 +463,22 @@ with tab1:
         "MF_kum", "PF_kum", "Fees_kum_total",
     ]
     view_cols = [c for c in view_cols if c in df.columns]
-
     display_df = df[view_cols].copy()
     display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
 
-    # Format numerics
-    round_map = {
-        "Close": 2, "Brutto_Rendite": 6, "NAV_gross": 2, "MF_Amount": 2,
-        "NAV_nach_MF": 2, "HWM_alt": 2, "PF_Basis": 2, "PF_Amount": 2,
-        "NAV_net": 2, "HWM_neu": 2, "MF_kum": 2, "PF_kum": 2, "Fees_kum_total": 2
+    # Numeric rounding for display
+    round_map: Dict[str, int] = {
+        "Close": 2, "Brutto_Rendite": 6,
+        "NAV_gross": 2, "MF_Amount": 2, "NAV_nach_MF": 2,
+        "HWM_alt": 2, "PF_Basis": 2, "PF_Amount": 2,
+        "NAV_net": 2, "HWM_neu": 2,
+        "MF_kum": 2, "PF_kum": 2, "Fees_kum_total": 2,
     }
     for col, nd in round_map.items():
         if col in display_df.columns:
             display_df[col] = pd.to_numeric(display_df[col], errors="coerce").round(nd)
 
-    # Make everything string for perfect stability
-    display_safe = display_df.copy()
-    if "Date" in display_safe.columns:
-        display_safe["Date"] = pd.to_datetime(display_safe["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    display_safe = display_safe.astype(str)
-
-    # IMPORTANT: no st.dataframe here (Arrow crash)
-    st.markdown(
-        f"""
-        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.12);
-                    border-radius:10px; padding:8px;">
-          {display_safe.to_html(index=False)}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-
-
+    render_html_table(display_df, height_px=520)
 
 with tab2:
     out = df.copy()
@@ -518,7 +503,7 @@ with tab2:
         mime="text/csv",
     )
 
-# Footer
+
 st.caption(
     f"Modus: {params.perf_crystallization.upper()} | "
     f"Zeitraum: {start_date.date()} – {end_date.date()} | "
