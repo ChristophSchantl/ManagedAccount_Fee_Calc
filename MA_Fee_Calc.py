@@ -492,7 +492,12 @@ with tab1:
         "Fees_kum_total": 2,
         "T_Fee_pDay": 2,
     }
-    display_df = display_df.round(round_map)
+    # Robust: runden nur dort, wo es numeric ist – spaltenweise
+    for col, nd in round_map.items():
+        if col in display_df.columns:
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+            display_df[col] = display_df[col].round(nd)
+
 
     st.dataframe(
         display_df,
