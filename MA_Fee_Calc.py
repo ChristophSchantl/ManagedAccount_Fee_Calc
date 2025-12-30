@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,7 @@ st.markdown(
       .block-container { padding-top: 1.0rem; padding-bottom: 2.0rem; }
       div[data-testid="stMetricValue"] { font-size: 1.45rem; }
       div[data-testid="stMetricLabel"] { font-size: 0.9rem; opacity: 0.85; }
+      .smallnote { font-size: 0.85rem; opacity: 0.80; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -32,18 +33,19 @@ st.markdown(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data classes
+# Data classes (NO Streamlit UI code here!)
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class FeeParams:
-    mgmt_fee_pa: float          # e.g. 0.02
-    perf_fee: float             # e.g. 0.20
-    start_nav: float            # e.g. 1_000_000
-    daycount: int               # 360/365
-    perf_crystallization: str   # "daily" or "monthly"
+    mgmt_fee_pa: float              # e.g. 0.02
+    perf_fee: float                 # e.g. 0.20
+    min_mgmt_fee_monthly: float     # e.g. 3000.0 (monthly floor)
+    start_nav: float                # e.g. 1_000_000
+    daycount: int                   # 360/365
+    perf_crystallization: str       # "daily" or "monthly"
     date_col: str
     price_col: str
-    resample_bdays: bool        # optional hardening
+    resample_bdays: bool            # optional hardening
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -73,43 +75,6 @@ def to_number_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s3, errors="coerce")
 
 
-def arrow_safe_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make a DataFrame safe for Streamlit Cloud's Arrow serialization.
-    - removes tz info
-    - converts Period/Interval and "object with lists/dicts" to string
-    - resets index
-    """
-    out = df.copy()
-    out = out.reset_index(drop=True)
-
-    # datetime: ensure tz-naive
-    for c in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[c]):
-            out[c] = pd.to_datetime(out[c], errors="coerce")
-            try:
-                if getattr(out[c].dt, "tz", None) is not None:
-                    out[c] = out[c].dt.tz_convert(None)
-            except Exception:
-                out[c] = out[c].astype(str)
-
-    # Period/Interval -> str
-    for c in out.columns:
-        dt = str(out[c].dtype)
-        if dt.startswith(("period", "interval")):
-            out[c] = out[c].astype(str)
-
-    # object columns with non-serializable python objects -> str
-    obj_cols = out.select_dtypes(include=["object"]).columns
-    for c in obj_cols:
-        sample = out[c].dropna().head(100)
-        if len(sample) > 0:
-            if sample.map(lambda x: isinstance(x, (dict, list, tuple, set))).any():
-                out[c] = out[c].astype(str)
-
-    return out
-
-
 def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) -> pd.DataFrame:
     if upload is None:
         idx = pd.bdate_range("2023-01-02", periods=520)
@@ -125,7 +90,7 @@ def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) ->
         if name.endswith(".xlsx") or name.endswith(".xls"):
             df = pd.read_excel(io.BytesIO(raw))
         else:
-            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", on_bad_lines='warn')
+            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", on_bad_lines="warn")
     except Exception as e:
         raise ValueError(f"Datei-Parsing-Fehler: {e}")
 
@@ -168,7 +133,7 @@ def fmt_pct(x: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fee Engine
+# Fee Engine (inkl. Min. Mgmt Fee/Monat als Month-End True-Up)
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df = df_prices.copy().sort_values(p.date_col).reset_index(drop=True)
@@ -184,13 +149,39 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df["Brutto_Rendite"] = df["Close"] / base_price
     df["NAV_gross"] = p.start_nav * df["Brutto_Rendite"]
 
-    df["MF_Amount"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
-    df.loc[df["Tage"] == 0, "MF_Amount"] = 0.0
+    # Arrow-safe month key (string)
+    df["Month"] = df["Date"].dt.strftime("%Y-%m")
+
+    # Mgmt Fee: daily accrual (MF_Base) + month-end True-Up to reach floor
+    df["MF_Base"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
+    df.loc[df["Tage"] == 0, "MF_Base"] = 0.0
+
+    # detect month-end
+    months = df["Month"].values
+    is_month_end = np.zeros(len(df), dtype=bool)
+    if len(df) > 0:
+        is_month_end[-1] = True
+    if len(df) > 1:
+        is_month_end[:-1] = months[:-1] != months[1:]
+
+    df["MF_MinAdj"] = 0.0
+    floor = float(p.min_mgmt_fee_monthly or 0.0)
+
+    if floor > 0:
+        mf_month_sum = df.groupby("Month")["MF_Base"].sum()
+        shortfall = (floor - mf_month_sum).clip(lower=0.0)
+
+        # allocate shortfall to last row of each month (true-up)
+        for m_key, adj in shortfall.items():
+            if adj > 0:
+                idx_last = df.index[(df["Month"] == m_key) & (is_month_end)].tolist()
+                if idx_last:
+                    df.at[idx_last[0], "MF_MinAdj"] = float(adj)
+
+    df["MF_Amount"] = df["MF_Base"] + df["MF_MinAdj"]
     df["NAV_nach_MF"] = df["NAV_gross"] - df["MF_Amount"]
 
-    # CRITICAL FIX: Use string month representation instead of Period
-    df["Month"] = df["Date"].dt.strftime("%Y-%m")  # String statt Period
-
+    # Performance fee + HWM
     df["HWM_alt"] = np.nan
     df["PF_Basis"] = 0.0
     df["PF_Amount"] = 0.0
@@ -214,18 +205,17 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
             df.at[i, "HWM_neu"] = hwm_new
             hwm = hwm_new
     else:
-        months = df["Month"].values
         for i in range(len(df)):
             df.at[i, "HWM_alt"] = hwm
             nav_after_mf = float(df.at[i, "NAV_nach_MF"])
-            is_month_end = (i == len(df) - 1) or (months[i] != months[i + 1])
+            month_end = is_month_end[i]
 
             pf_basis = 0.0
             pf_amt = 0.0
             nav_net = nav_after_mf
             hwm_new = hwm
 
-            if is_month_end:
+            if month_end:
                 pf_basis = max(0.0, nav_after_mf - hwm)
                 pf_amt = pf_basis * p.perf_fee
                 nav_net = nav_after_mf - pf_amt
@@ -237,6 +227,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
             df.at[i, "NAV_net"] = nav_net
             df.at[i, "HWM_neu"] = hwm_new
 
+    # Cum sums + indices + drawdowns
     df["MF_kum"] = df["MF_Amount"].cumsum()
     df["PF_kum"] = df["PF_Amount"].cumsum()
     df["Fees_kum_total"] = df["MF_kum"] + df["PF_kum"]
@@ -247,25 +238,21 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df["DD_net"] = df["NAV_net"] / df["NAV_net"].cummax() - 1.0
 
     # Monthly summary
-    # Group by string month and aggregate
     m = df.groupby("Month", as_index=False).agg(
         NAV_gross=("NAV_gross", "last"),
         NAV_net=("NAV_net", "last"),
         MF=("MF_Amount", "sum"),
+        MF_Base=("MF_Base", "sum"),
+        MF_MinAdj=("MF_MinAdj", "sum"),
         PF=("PF_Amount", "sum"),
         Fees=("Fees_kum_total", "last"),
     )
-    
-    # Add date column for plotting
-    m["Month_date"] = pd.to_datetime(m["Month"] + "-01")
-    
-    # Calculate fee rates
-    m["FeeRate_MF_bps"] = (m["MF"] / m["NAV_gross"]) * 1e4
-    m["FeeRate_total_bps"] = ((m["MF"] + m["PF"]) / m["NAV_gross"]) * 1e4
-    
-    # Store monthly data as attribute
-    df.attrs["monthly"] = m
 
+    m["Month_date"] = pd.to_datetime(m["Month"] + "-01")
+    m["FeeRate_MF_bps"] = np.where(m["NAV_gross"] > 0, (m["MF"] / m["NAV_gross"]) * 1e4, np.nan)
+    m["FeeRate_total_bps"] = np.where(m["NAV_gross"] > 0, ((m["MF"] + m["PF"]) / m["NAV_gross"]) * 1e4, np.nan)
+
+    df.attrs["monthly"] = m
     return df
 
 
@@ -273,7 +260,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("Managed Account Fee Calculator")
-st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Arrow-safe)")
+st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Streamlit Cloud safe)")
 
 with st.sidebar:
     st.header("Inputs")
@@ -287,6 +274,11 @@ with st.sidebar:
     mgmt_fee_ui = st.number_input("Mgmt_Fee_p_a (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.25)
     perf_fee_ui = st.number_input("Perf_Fee (%)", min_value=0.0, max_value=50.0, value=20.0, step=1.0)
     start_nav = st.number_input("Start_NAV", min_value=1_000.0, max_value=1_000_000_000.0, value=1_000_000.0, step=10_000.0)
+    min_mgmt_fee_monthly = st.number_input(
+        "Min. Mgmt Fee pro Monat (€)",
+        min_value=0.0, max_value=1_000_000.0,
+        value=3000.0, step=100.0
+    )
 
     daycount = st.selectbox("Daycount", options=[360, 365], index=1)
 
@@ -302,6 +294,25 @@ with st.sidebar:
     resample_bdays = st.checkbox("Business-Day Resample + Forward Fill", value=False)
 
     st.divider()
+    st.subheader("Angestellter PM – Spanien (Fixkosten)")
+    monthly_gross_salary = st.number_input(
+        "Fixgehalt Brutto pro Monat (€)",
+        min_value=0.0, max_value=50_000.0,
+        value=3000.0, step=100.0
+    )
+    employer_social_rate = st.number_input(
+        "AG Sozialabgaben (%)",
+        min_value=0.0, max_value=50.0,
+        value=30.0, step=1.0
+    ) / 100.0
+    employee_tax_rate = st.number_input(
+        "AN Abgaben + IRPF (%)",
+        min_value=0.0, max_value=60.0,
+        value=36.0, step=1.0
+    ) / 100.0
+    st.markdown('<div class="smallnote">Hinweis: Vereinfachte Näherung (keine Steuerberatung).</div>', unsafe_allow_html=True)
+
+    st.divider()
     st.subheader("Charts")
     show_gross = st.checkbox("Gross NAV anzeigen", value=True)
     show_drawdown = st.checkbox("Drawdown Chart", value=True)
@@ -314,6 +325,7 @@ try:
     params = FeeParams(
         mgmt_fee_pa=_to_float_pct(float(mgmt_fee_ui)),
         perf_fee=_to_float_pct(float(perf_fee_ui)),
+        min_mgmt_fee_monthly=float(min_mgmt_fee_monthly),
         start_nav=float(start_nav),
         daycount=int(daycount),
         perf_crystallization=str(perf_mode),
@@ -321,11 +333,18 @@ try:
         price_col=str(price_col),
         resample_bdays=bool(resample_bdays),
     )
+
     df = compute_fee_engine(df_prices, params)
     m = df.attrs["monthly"]
 except Exception as e:
     st.error(f"Input/Parsing/Compute Fehler: {e}")
     st.stop()
+
+# Spain employee costs (OPEX, not NAV-relevant)
+employer_cost_month = float(monthly_gross_salary) * (1.0 + float(employer_social_rate))
+employer_cost_year = employer_cost_month * 12.0
+employee_net_month = float(monthly_gross_salary) * (1.0 - float(employee_tax_rate))
+employee_net_year = employee_net_month * 12.0
 
 # KPIs
 start_date = df["Date"].iloc[0]
@@ -344,8 +363,10 @@ fee_drag_tr = gross_tr - net_tr
 
 gross_cagr = cagr(params.start_nav, nav_gross_end, total_days)
 net_cagr = cagr(params.start_nav, nav_net_end, total_days)
-
 net_vol = ann_vol_log(df["NAV_net"])
+
+avg_mf_month = float(m["MF"].mean()) if len(m) else np.nan
+avg_total_fee_month = float((m["MF"] + m["PF"]).mean()) if len(m) else np.nan
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Start NAV", fmt_money(params.start_nav))
@@ -356,8 +377,21 @@ c5.metric("Mgmt / Perf Fees", f"{fmt_money(fees_mf)} / {fmt_money(fees_pf)}")
 c6.metric("Fee Drag (TR)", fmt_pct(fee_drag_tr))
 
 st.divider()
+st.subheader("Fixkosten – Angestellter Portfolio Manager (Spanien)")
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Brutto PM (Monat)", f"{fmt_money(monthly_gross_salary)} €")
+k2.metric("Netto PM (Monat)", f"{fmt_money(employee_net_month)} €")
+k3.metric("FO Gesamtkosten (Monat)", f"{fmt_money(employer_cost_month)} €")
+k4.metric("FO Gesamtkosten (p.a.)", f"{fmt_money(employer_cost_year)} €")
+
+st.divider()
+c7, c8 = st.columns(2)
+c7.metric("Ø Mgmt Fee / Monat", f"{fmt_money(avg_mf_month)}" if np.isfinite(avg_mf_month) else "n/a")
+c8.metric("Ø Total Fees / Monat", f"{fmt_money(avg_total_fee_month)}" if np.isfinite(avg_total_fee_month) else "n/a")
 
 # Charts – NAV & HWM + Cum Fees
+st.divider()
 left, right = st.columns([1.35, 1.0])
 
 with left:
@@ -365,7 +399,10 @@ with left:
     if show_gross:
         fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_gross"], mode="lines", name="NAV Gross", line=dict(width=2)))
     fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_net"], mode="lines", name="NAV Net", line=dict(width=3)))
-    fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["HWM_neu"], mode="lines", name="HWM (Net)", line=dict(width=3, dash="dot", color="red")))
+    fig_nav.add_trace(go.Scatter(
+        x=df["Date"], y=df["HWM_neu"], mode="lines", name="HWM (Net)",
+        line=dict(width=3, dash="dot", color="red")
+    ))
     fig_nav.update_layout(
         title="NAV Entwicklung & High Water Mark",
         xaxis_title="Datum",
@@ -396,15 +433,15 @@ row2a, row2b = st.columns([1.0, 1.0])
 
 with row2a:
     m_plot = m.copy()
-    # CRITICAL FIX: Use string representation for Plotly
     m_plot["MonthStr"] = m_plot["Month"]
-    
+
     fig_mfees = go.Figure()
-    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF"], name="Mgmt Fee"))
+    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_Base"], name="Mgmt Fee (Base)"))
+    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_MinAdj"], name="Mgmt Fee (Min Adj)"))
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["PF"], name="Perf Fee"))
     fig_mfees.update_layout(
         barmode="stack",
-        title="Fees pro Monat (Stacked)",
+        title="Fees pro Monat (Stacked) – inkl. Min-Fee True-Up",
         xaxis_title="Monat",
         yaxis_title="Fee Amount",
         margin=dict(l=10, r=10, t=60, b=40),
@@ -471,7 +508,7 @@ tab1, tab2 = st.tabs(["Detail-Tabelle", "Downloads"])
 with tab1:
     view_cols = [
         "Date", "Close", "Tage", "Brutto_Rendite",
-        "NAV_gross", "MF_Amount", "NAV_nach_MF",
+        "NAV_gross", "MF_Base", "MF_MinAdj", "MF_Amount", "NAV_nach_MF",
         "HWM_alt", "PF_Basis", "PF_Amount",
         "NAV_net", "HWM_neu",
         "MF_kum", "PF_kum", "Fees_kum_total",
@@ -481,11 +518,12 @@ with tab1:
     display_df = df[view_cols].copy()
     display_df = display_df.loc[:, ~display_df.columns.duplicated()].copy()
 
-    # Runde numeric columns safely
     round_map = {
         "Close": 2,
         "Brutto_Rendite": 6,
         "NAV_gross": 2,
+        "MF_Base": 2,
+        "MF_MinAdj": 2,
         "MF_Amount": 2,
         "NAV_nach_MF": 2,
         "HWM_alt": 2,
@@ -497,23 +535,19 @@ with tab1:
         "PF_kum": 2,
         "Fees_kum_total": 2,
     }
-    
     for col, decimals in round_map.items():
         if col in display_df.columns:
             display_df[col] = display_df[col].round(decimals)
 
-    # CRITICAL FIX: Convert all to string for Arrow safety
+    # Arrow-safe: render as HTML (no Arrow serialization)
     display_df["Date"] = display_df["Date"].dt.strftime("%Y-%m-%d")
-    
-    # Convert all columns to string for ultimate Arrow safety
     for col in display_df.columns:
         display_df[col] = display_df[col].astype(str)
 
-    # Display as HTML table (100% Arrow-safe)
     html = display_df.to_html(index=False)
     st.markdown(
         f"""
-        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.1); 
+        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.1);
                     border-radius:8px; padding:6px;">
           {html}
         </div>
@@ -522,19 +556,22 @@ with tab1:
     )
 
 with tab2:
-    # Prepare data for export - ensure all data is Arrow-safe
     out = df.copy()
     out.insert(0, "Mgmt_Fee_p_a", params.mgmt_fee_pa)
     out.insert(1, "Perf_Fee", params.perf_fee)
-    out.insert(2, "Start_NAV", params.start_nav)
-    out.insert(3, "Daycount", params.daycount)
-    out.insert(4, "Perf_Mode", params.perf_crystallization)
-    out.insert(5, "Resample_BDays", params.resample_bdays)
-    
-    # Convert date to string for export
+    out.insert(2, "Min_Mgmt_Fee_Monthly", params.min_mgmt_fee_monthly)
+    out.insert(3, "Start_NAV", params.start_nav)
+    out.insert(4, "Daycount", params.daycount)
+    out.insert(5, "Perf_Mode", params.perf_crystallization)
+    out.insert(6, "Resample_BDays", params.resample_bdays)
+
+    # Spain employee assumptions to exports
+    out.insert(7, "PM_Gross_Month", float(monthly_gross_salary))
+    out.insert(8, "AG_Social_Rate", float(employer_social_rate))
+    out.insert(9, "AN_Tax_Rate", float(employee_tax_rate))
+
     out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
-    
-    # Convert monthly summary date to string
+
     m_export = m.copy()
     if "Month_date" in m_export.columns:
         m_export["Month_date"] = m_export["Month_date"].dt.strftime("%Y-%m-%d")
