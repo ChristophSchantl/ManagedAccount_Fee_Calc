@@ -385,10 +385,6 @@ k2.metric("Netto PM (Monat)", f"{fmt_money(employee_net_month)} €")
 k3.metric("FO Gesamtkosten (Monat)", f"{fmt_money(employer_cost_month)} €")
 k4.metric("FO Gesamtkosten (p.a.)", f"{fmt_money(employer_cost_year)} €")
 
-st.divider()
-c7, c8 = st.columns(2)
-c7.metric("Ø Mgmt Fee / Monat", f"{fmt_money(avg_mf_month)}" if np.isfinite(avg_mf_month) else "n/a")
-c8.metric("Ø Total Fees / Monat", f"{fmt_money(avg_total_fee_month)}" if np.isfinite(avg_total_fee_month) else "n/a")
 
 # Charts – NAV & HWM + Cum Fees
 st.divider()
