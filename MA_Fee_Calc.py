@@ -294,23 +294,41 @@ with st.sidebar:
     resample_bdays = st.checkbox("Business-Day Resample + Forward Fill", value=False)
 
     st.divider()
-    st.subheader("Angestellter PM – Spanien (Fixkosten)")
+    st.subheader("Angestellter PM – Spanien (Balearen)")
+
     monthly_gross_salary = st.number_input(
         "Fixgehalt Brutto pro Monat (€)",
         min_value=0.0, max_value=50_000.0,
         value=3000.0, step=100.0
     )
+    
+    employee_social_rate = st.number_input(
+        "AN Sozialabgaben (%)",
+        min_value=0.0, max_value=20.0,
+        value=6.35, step=0.25
+    ) / 100.0
+    
+    employee_irpf_rate = st.number_input(
+        "IRPF effektiv (Balearen, %)",
+        min_value=0.0, max_value=40.0,
+        value=17.0, step=0.5
+    ) / 100.0
+
+    
     employer_social_rate = st.number_input(
         "AG Sozialabgaben (%)",
         min_value=0.0, max_value=50.0,
         value=30.0, step=1.0
     ) / 100.0
-    employee_tax_rate = st.number_input(
-        "AN Abgaben + IRPF (%)",
-        min_value=0.0, max_value=60.0,
-        value=36.0, step=1.0
-    ) / 100.0
-    st.markdown('<div class="smallnote">Hinweis: Vereinfachte Näherung (keine Steuerberatung).</div>', unsafe_allow_html=True)
+    
+    st.markdown(
+        '<div class="smallnote">'
+        'Default: Balearen ~6.35 % AN-Sozialabgaben, ~16–18 % IRPF effektiv '
+        '(vereinfachte Näherung, keine Steuerberatung).'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
 
     st.divider()
     st.subheader("Charts")
@@ -343,7 +361,11 @@ except Exception as e:
 # Spain employee costs (OPEX, not NAV-relevant)
 employer_cost_month = float(monthly_gross_salary) * (1.0 + float(employer_social_rate))
 employer_cost_year = employer_cost_month * 12.0
-employee_net_month = float(monthly_gross_salary) * (1.0 - float(employee_tax_rate))
+employee_net_month = (
+    float(monthly_gross_salary)
+    * (1.0 - float(employee_social_rate))
+    * (1.0 - float(employee_irpf_rate))
+)
 employee_net_year = employee_net_month * 12.0
 
 # KPIs
