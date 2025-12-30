@@ -365,7 +365,7 @@ with left:
     if show_gross:
         fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_gross"], mode="lines", name="NAV Gross", line=dict(width=2)))
     fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["NAV_net"], mode="lines", name="NAV Net", line=dict(width=3)))
-    fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["HWM_neu"], mode="lines", name="HWM (Net)", line=dict(width=1, dash="dot", color="red")))
+    fig_nav.add_trace(go.Scatter(x=df["Date"], y=df["HWM_neu"], mode="lines", name="HWM (Net)", line=dict(width=1, dash="dot", color="green")))
     fig_nav.update_layout(
         title="NAV Entwicklung & High Water Mark",
         xaxis_title="Datum",
