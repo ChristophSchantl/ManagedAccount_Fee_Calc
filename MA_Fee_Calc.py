@@ -501,6 +501,7 @@ with tab1:
     )
 
 
+
 with tab2:
     out = df.copy()
     out.insert(0, "Mgmt_Fee_p_a", p.mgmt_fee_pa)
