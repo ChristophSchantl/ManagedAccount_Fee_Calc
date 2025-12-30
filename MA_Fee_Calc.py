@@ -503,7 +503,17 @@ with tab1:
     # Ultimate safety: remaining exotic dtypes ebenfalls string
     display_safe = display_safe.astype(str)
 
-    st.dataframe(display_safe, use_container_width=True, height=520)
+    # Arrow-free table rendering (Streamlit Cloud / Py3.13-proof)
+    html = display_safe.to_html(index=False)
+    st.markdown(
+        f"""
+        <div style="max-height:520px; overflow:auto; border:1px solid rgba(0,0,0,0.1); border-radius:8px; padding:6px;">
+          {html}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 
 
 
