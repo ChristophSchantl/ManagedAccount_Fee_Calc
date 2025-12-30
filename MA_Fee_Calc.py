@@ -260,7 +260,7 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("Managed Account Fee Calculator")
-st.caption("NAV, Fees, HWM & Fee Drag – CSV/XLSX Input, KPI-Tiles, Plotly-Charts, Exports. (Streamlit Cloud safe)")
+st.caption("Asset Manager: Christoph Schantl")
 
 with st.sidebar:
     st.header("Inputs")
