@@ -1,3 +1,4 @@
+# streamlit_app.py
 # Managed Account Fee Calculator (Investor-ready, Streamlit Cloud safe)
 # Dependencies: streamlit, pandas, numpy, plotly, openpyxl
 
@@ -32,7 +33,7 @@ st.markdown(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data classes (NO Streamlit UI code here!)
+# Data classes
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class FeeParams:
@@ -48,7 +49,7 @@ class FeeParams:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers (robust parsing + Arrow-safe display)
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_float_pct(x: float) -> float:
     return x / 100.0 if x > 1.0 else x
@@ -89,6 +90,7 @@ def parse_prices(upload: Optional[io.BytesIO], date_col: str, price_col: str) ->
         if name.endswith(".xlsx") or name.endswith(".xls"):
             df = pd.read_excel(io.BytesIO(raw))
         else:
+            # auto-detect sep
             df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", on_bad_lines="warn")
     except Exception as e:
         raise ValueError(f"Datei-Parsing-Fehler: {e}")
@@ -132,7 +134,7 @@ def fmt_pct(x: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fee Engine (inkl. Min. Mgmt Fee/Monat als Month-End True-Up) — NAV-relevant
+# Fee Engine (PATH-CORRECT, NAV-relevant)
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     df = df_prices.copy().sort_values(p.date_col).reset_index(drop=True)
@@ -141,98 +143,139 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
     if p.resample_bdays:
         df = df.set_index("Date").asfreq("B").ffill().reset_index()
 
+    if len(df) < 2:
+        raise ValueError("Zu wenig Datenpunkte. Mindestens 2 Zeilen erforderlich.")
+
     df["Tage"] = df["Date"].diff().dt.days.fillna(0).astype(int)
     df.loc[df["Tage"] < 0, "Tage"] = 0
 
+    # month key + month-end detection (string month safe for Arrow)
+    df["Month"] = df["Date"].dt.strftime("%Y-%m")
+    months = df["Month"].values
+    is_month_end = np.zeros(len(df), dtype=bool)
+    is_month_end[-1] = True
+    is_month_end[:-1] = months[:-1] != months[1:]
+    df["IsMonthEnd"] = is_month_end
+
+    # "Gross" index for display only (pure underlying performance, no fees)
     base_price = float(df.loc[0, "Close"])
     df["Brutto_Rendite"] = df["Close"] / base_price
     df["NAV_gross"] = p.start_nav * df["Brutto_Rendite"]
 
-    # Arrow-safe month key (string)
-    df["Month"] = df["Date"].dt.strftime("%Y-%m")
-
-    # Mgmt Fee: daily accrual (MF_Base) + month-end True-Up to reach floor (NAV-relevant)
-    df["MF_Base"] = df["NAV_gross"] * (p.mgmt_fee_pa * df["Tage"] / p.daycount)
-    df.loc[df["Tage"] == 0, "MF_Base"] = 0.0
-
-    # detect month-end
-    months = df["Month"].values
-    is_month_end = np.zeros(len(df), dtype=bool)
-    if len(df) > 0:
-        is_month_end[-1] = True
-    if len(df) > 1:
-        is_month_end[:-1] = months[:-1] != months[1:]
-
-    df["MF_MinAdj"] = 0.0
-    floor = float(p.min_mgmt_fee_monthly or 0.0)
-
-    if floor > 0:
-        mf_month_sum = df.groupby("Month")["MF_Base"].sum()
-        shortfall = (floor - mf_month_sum).clip(lower=0.0)
-
-        # allocate shortfall to last row of each month (true-up)
-        for m_key, adj in shortfall.items():
-            if adj > 0:
-                idx_last = df.index[(df["Month"] == m_key) & (is_month_end)].tolist()
-                if idx_last:
-                    df.at[idx_last[0], "MF_MinAdj"] = float(adj)
-
-    df["MF_Amount"] = df["MF_Base"] + df["MF_MinAdj"]
-    df["NAV_nach_MF"] = df["NAV_gross"] - df["MF_Amount"]
-
-    # Performance fee + HWM (basis: NAV_nach_MF)
+    # Containers
+    df["NAV_preFee"] = np.nan          # NAV after market move, before any fees
+    df["MF_Base"] = 0.0                # daily accrual
+    df["MF_MinAdj"] = 0.0              # month-end true-up
+    df["MF_Amount"] = 0.0              # total mgmt fee deducted that row
+    df["NAV_nach_MF"] = np.nan         # after mgmt fee
     df["HWM_alt"] = np.nan
     df["PF_Basis"] = 0.0
     df["PF_Amount"] = 0.0
     df["NAV_net"] = np.nan
     df["HWM_neu"] = np.nan
 
+    floor = float(p.min_mgmt_fee_monthly or 0.0)
+
+    nav = float(p.start_nav)
     hwm = float(p.start_nav)
 
-    if p.perf_crystallization == "daily":
-        for i in range(len(df)):
+    # track month mgmt accrual for floor true-up
+    current_month = df.loc[0, "Month"]
+    mf_month_sum = 0.0
+
+    # init row 0: no return, no fees (convention)
+    df.at[0, "NAV_preFee"] = nav
+    df.at[0, "NAV_nach_MF"] = nav
+    df.at[0, "NAV_net"] = nav
+    df.at[0, "HWM_alt"] = hwm
+    df.at[0, "HWM_neu"] = hwm
+
+    for i in range(1, len(df)):
+        days = int(df.at[i, "Tage"])
+        if days <= 0:
+            # treat as same-day; keep nav and no fees
+            df.at[i, "NAV_preFee"] = nav
+            df.at[i, "NAV_nach_MF"] = nav
+            df.at[i, "NAV_net"] = nav
             df.at[i, "HWM_alt"] = hwm
-            nav_after_mf = float(df.at[i, "NAV_nach_MF"])
+            df.at[i, "HWM_neu"] = hwm
+            continue
+
+        # 1) apply market move on the CURRENT NAV (fee-compounded path)
+        prev_close = float(df.at[i - 1, "Close"])
+        cur_close = float(df.at[i, "Close"])
+        if prev_close <= 0 or cur_close <= 0:
+            raise ValueError("Close muss > 0 sein.")
+
+        gross_factor = cur_close / prev_close
+        nav = nav * gross_factor
+        df.at[i, "NAV_preFee"] = nav
+
+        # 2) mgmt fee daily accrual on current NAV_preFee
+        mf_base = nav * (p.mgmt_fee_pa * days / float(p.daycount))
+        df.at[i, "MF_Base"] = mf_base
+        mf_month_sum += mf_base
+
+        mf_min_adj = 0.0
+        mf_amount = mf_base
+
+        # month-end floor true-up (NAV-relevant)
+        if bool(df.at[i, "IsMonthEnd"]) and floor > 0:
+            shortfall = max(0.0, floor - mf_month_sum)
+            mf_min_adj = shortfall
+            mf_amount = mf_base + mf_min_adj
+
+        df.at[i, "MF_MinAdj"] = mf_min_adj
+        df.at[i, "MF_Amount"] = mf_amount
+
+        nav_after_mf = nav - mf_amount
+        df.at[i, "NAV_nach_MF"] = nav_after_mf
+
+        # reset month accumulator at month-end
+        if bool(df.at[i, "IsMonthEnd"]):
+            mf_month_sum = 0.0
+
+        # 3) performance fee (HWM on net NAV after PF)
+        df.at[i, "HWM_alt"] = hwm
+
+        pf_basis = 0.0
+        pf_amt = 0.0
+        nav_net = nav_after_mf
+        hwm_new = hwm
+
+        if p.perf_crystallization == "daily":
             pf_basis = max(0.0, nav_after_mf - hwm)
             pf_amt = pf_basis * p.perf_fee
             nav_net = nav_after_mf - pf_amt
             hwm_new = nav_net if pf_basis > 0 else hwm
-
-            df.at[i, "PF_Basis"] = pf_basis
-            df.at[i, "PF_Amount"] = pf_amt
-            df.at[i, "NAV_net"] = nav_net
-            df.at[i, "HWM_neu"] = hwm_new
             hwm = hwm_new
-    else:
-        for i in range(len(df)):
-            df.at[i, "HWM_alt"] = hwm
-            nav_after_mf = float(df.at[i, "NAV_nach_MF"])
-            month_end = is_month_end[i]
 
-            pf_basis = 0.0
-            pf_amt = 0.0
-            nav_net = nav_after_mf
-            hwm_new = hwm
-
-            if month_end:
+        elif p.perf_crystallization == "monthly":
+            if bool(df.at[i, "IsMonthEnd"]):
                 pf_basis = max(0.0, nav_after_mf - hwm)
                 pf_amt = pf_basis * p.perf_fee
                 nav_net = nav_after_mf - pf_amt
                 hwm_new = nav_net if pf_basis > 0 else hwm
                 hwm = hwm_new
+        else:
+            raise ValueError("perf_crystallization muss 'daily' oder 'monthly' sein.")
 
-            df.at[i, "PF_Basis"] = pf_basis
-            df.at[i, "PF_Amount"] = pf_amt
-            df.at[i, "NAV_net"] = nav_net
-            df.at[i, "HWM_neu"] = hwm_new
+        df.at[i, "PF_Basis"] = pf_basis
+        df.at[i, "PF_Amount"] = pf_amt
+        df.at[i, "NAV_net"] = nav_net
+        df.at[i, "HWM_neu"] = hwm_new
 
-    # Cum sums + indices + drawdowns
+        # carry forward NAV for next step
+        nav = nav_net
+
+    # Cum sums + indices + drawdowns (net is fee-compounded path)
     df["MF_kum"] = df["MF_Amount"].cumsum()
     df["PF_kum"] = df["PF_Amount"].cumsum()
     df["Fees_kum_total"] = df["MF_kum"] + df["PF_kum"]
 
     df["NAV_gross_idx"] = df["NAV_gross"] / p.start_nav
     df["NAV_net_idx"] = df["NAV_net"] / p.start_nav
+
     df["DD_gross"] = df["NAV_gross"] / df["NAV_gross"].cummax() - 1.0
     df["DD_net"] = df["NAV_net"] / df["NAV_net"].cummax() - 1.0
 
@@ -246,10 +289,9 @@ def compute_fee_engine(df_prices: pd.DataFrame, p: FeeParams) -> pd.DataFrame:
         PF=("PF_Amount", "sum"),
         Fees=("Fees_kum_total", "last"),
     )
-
     m["Month_date"] = pd.to_datetime(m["Month"] + "-01")
-    m["FeeRate_MF_bps"] = np.where(m["NAV_gross"] > 0, (m["MF"] / m["NAV_gross"]) * 1e4, np.nan)
-    m["FeeRate_total_bps"] = np.where(m["NAV_gross"] > 0, ((m["MF"] + m["PF"]) / m["NAV_gross"]) * 1e4, np.nan)
+    m["FeeRate_MF_bps"] = np.where(m["NAV_net"] > 0, (m["MF"] / m["NAV_net"]) * 1e4, np.nan)
+    m["FeeRate_total_bps"] = np.where(m["NAV_net"] > 0, ((m["MF"] + m["PF"]) / m["NAV_net"]) * 1e4, np.nan)
 
     df.attrs["monthly"] = m
     return df
@@ -274,7 +316,6 @@ with st.sidebar:
     perf_fee_ui = st.number_input("Perf_Fee (%)", min_value=0.0, max_value=50.0, value=20.0, step=1.0)
     start_nav = st.number_input("Start_NAV", min_value=1_000.0, max_value=1_000_000_000.0, value=1_000_000.0, step=10_000.0)
 
-    # Floor (Minimum) bleibt — entspricht deinem "Fixum" in der Diskussion
     min_mgmt_fee_monthly = st.number_input(
         "Management Fee Minimum / Floor (€/Monat, NAV-relevant)",
         min_value=0.0, max_value=1_000_000.0,
@@ -338,7 +379,6 @@ with st.sidebar:
     show_gross = st.checkbox("Gross NAV anzeigen", value=True)
 
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Compute
 # ──────────────────────────────────────────────────────────────────────────────
@@ -367,7 +407,7 @@ except Exception as e:
 # Spain payroll INFO (OPEX / compensation view; NOT NAV-relevant)
 # Convention: "Fixum" = Floor (Minimum Mgmt Fee per month)
 # ──────────────────────────────────────────────────────────────────────────────
-pm_gross_month = float(params.min_mgmt_fee_monthly)  # Fixum-Interpretation
+pm_gross_month = float(params.min_mgmt_fee_monthly)
 pm_gross_year = pm_gross_month * 12.0
 
 employer_cost_month = pm_gross_month * (1.0 + float(employer_social_rate))
@@ -380,20 +420,19 @@ employee_net_month = (
 )
 employee_net_year = employee_net_month * 12.0
 
-# extra: realized/avg mgmt fee (useful for FO economics)
 avg_mf_month = float(m["MF"].mean()) if len(m) else np.nan
 binds_floor_share = float((m["MF_MinAdj"] > 0).mean()) if len(m) else np.nan  # share of months where floor binds
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# KPIs
+# KPIs (incl. Option-A: Fees as % of Profit)
 # ──────────────────────────────────────────────────────────────────────────────
 start_date = df["Date"].iloc[0]
 end_date = df["Date"].iloc[-1]
 total_days = int((end_date - start_date).days)
 
-nav_gross_end = float(df["NAV_gross"].iloc[-1])
-nav_net_end = float(df["NAV_net"].iloc[-1])
+nav_gross_end = float(df["NAV_gross"].iloc[-1])     # display gross (index-based)
+nav_net_end = float(df["NAV_net"].iloc[-1])         # fee-compounded net
 fees_total = float(df["Fees_kum_total"].iloc[-1])
 fees_mf = float(df["MF_kum"].iloc[-1])
 fees_pf = float(df["PF_kum"].iloc[-1])
@@ -406,6 +445,12 @@ gross_cagr = cagr(params.start_nav, nav_gross_end, total_days)
 net_cagr = cagr(params.start_nav, nav_net_end, total_days)
 net_vol = ann_vol_log(df["NAV_net"])
 
+# Option-A fee shares
+net_profit = nav_net_end - params.start_nav
+fee_share_of_profit = (fees_total / net_profit) if net_profit > 0 else np.nan
+mf_share_of_profit = (fees_mf / net_profit) if net_profit > 0 else np.nan
+pf_share_of_profit = (fees_pf / net_profit) if net_profit > 0 else np.nan
+
 avg_total_fee_month = float((m["MF"] + m["PF"]).mean()) if len(m) else np.nan
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -414,11 +459,17 @@ c2.metric("End NAV (Net)", fmt_money(nav_net_end), fmt_pct(net_tr))
 c3.metric("CAGR (Net)", fmt_pct(net_cagr) if np.isfinite(net_cagr) else "n/a")
 c4.metric("Fees Total", fmt_money(fees_total), f"{(fees_total/params.start_nav)*100:,.2f}% of Start")
 c5.metric("Mgmt / Perf Fees", f"{fmt_money(fees_mf)} / {fmt_money(fees_pf)}")
-c6.metric("Fee Drag (TR)", fmt_pct(fee_drag_tr))
+c6.metric("Fees (% of Profit)", fmt_pct(fee_share_of_profit) if np.isfinite(fee_share_of_profit) else "n/a")
+
+st.caption(
+    f"Option A (Investor): Net Return + Fees ex-post. "
+    f"Mgmt Fee Share of Profit: {fmt_pct(mf_share_of_profit) if np.isfinite(mf_share_of_profit) else 'n/a'} | "
+    f"Perf Fee Share of Profit: {fmt_pct(pf_share_of_profit) if np.isfinite(pf_share_of_profit) else 'n/a'}"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Economics / Info block (aligns with your narrative)
+# Economics / Info block
 # ──────────────────────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("Fixum & Payroll-Info (Spanien/Balearen) – nur Information (nicht NAV-relevant)")
@@ -431,8 +482,8 @@ k4.metric("Avg Mgmt Fee realisiert (€/Monat)", f"{fmt_money(avg_mf_month)} €
 k5.metric("Floor bindet (Monate)", f"{binds_floor_share*100:,.0f}%" if np.isfinite(binds_floor_share) else "n/a")
 
 st.caption(
-    "Interpretation: Im ersten Jahr wird das Fixum als Management-Fee-Minimum (Floor) modelliert. "
-    "Die Payroll-Zahlen dienen nur als Info für FO/Investor und beeinflussen die NAV-Berechnung nicht."
+    "Interpretation: Fixum = Management-Fee-Minimum (Floor). Payroll-Zahlen nur Info für FO/Investor; "
+    "NAV-Berechnung bleibt davon unberührt."
 )
 
 
@@ -498,17 +549,35 @@ with row2a:
     )
     st.plotly_chart(fig_mfees, use_container_width=True)
 
+with row2b:
+    # Quick monthly net return view (optional but useful)
+    mm = m_plot.copy()
+    mm["Net_TR_m"] = mm["NAV_net"].pct_change()
+    fig_mret = go.Figure()
+    fig_mret.add_trace(go.Bar(x=mm["MonthStr"], y=mm["Net_TR_m"], name="Net Return (m/m)"))
+    fig_mret.update_layout(
+        title="Net Return (Monat/Monat)",
+        xaxis_title="Monat",
+        yaxis_title="Return",
+        margin=dict(l=10, r=10, t=60, b=40),
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig_mret, use_container_width=True)
 
 
-
+# ──────────────────────────────────────────────────────────────────────────────
 # Tables + Exports (Arrow-safe)
+# ──────────────────────────────────────────────────────────────────────────────
 st.divider()
 tab1, tab2 = st.tabs(["Detail-Tabelle", "Downloads"])
 
 with tab1:
     view_cols = [
-        "Date", "Close", "Tage", "Brutto_Rendite",
-        "NAV_gross", "MF_Base", "MF_MinAdj", "MF_Amount", "NAV_nach_MF",
+        "Date", "Close", "Tage", "Month", "IsMonthEnd",
+        "Brutto_Rendite",
+        "NAV_gross", "NAV_preFee",
+        "MF_Base", "MF_MinAdj", "MF_Amount", "NAV_nach_MF",
         "HWM_alt", "PF_Basis", "PF_Amount",
         "NAV_net", "HWM_neu",
         "MF_kum", "PF_kum", "Fees_kum_total",
@@ -522,6 +591,7 @@ with tab1:
         "Close": 2,
         "Brutto_Rendite": 6,
         "NAV_gross": 2,
+        "NAV_preFee": 2,
         "MF_Base": 2,
         "MF_MinAdj": 2,
         "MF_Amount": 2,
@@ -595,8 +665,7 @@ with tab2:
 st.caption(
     f"Modus: {params.perf_crystallization.upper()} | "
     f"Zeitraum: {start_date.date()} – {end_date.date()} | "
-    f"Gross CAGR: {fmt_pct(gross_cagr) if np.isfinite(gross_cagr) else 'n/a'} | "
+    f"Gross CAGR (display): {fmt_pct(gross_cagr) if np.isfinite(gross_cagr) else 'n/a'} | "
     f"Net CAGR: {fmt_pct(net_cagr) if np.isfinite(net_cagr) else 'n/a'} | "
     f"Net Vol (ann., log): {fmt_pct(net_vol) if np.isfinite(net_vol) else 'n/a'}"
 )
-
