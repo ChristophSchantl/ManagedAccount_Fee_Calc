@@ -486,7 +486,7 @@ with row2a:
     fig_mfees = go.Figure()
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_Base"], name="Mgmt Fee (Base)"))
     fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["MF_MinAdj"], name="Mgmt Fee (Min Adj / Floor True-Up)"))
-    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["PF"], name="Perf Fee"))
+    fig_mfees.add_trace(go.Bar(x=m_plot["MonthStr"], y=m_plot["PF"], name="Perf Fee", marker=dict(color=PERF_GREEN, line=dict(width=0)))
     fig_mfees.update_layout(
         barmode="stack",
         title="Fees pro Monat (Stacked) – inkl. Floor True-Up",
@@ -497,7 +497,6 @@ with row2a:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     st.plotly_chart(fig_mfees, use_container_width=True)
-
 
 
 
